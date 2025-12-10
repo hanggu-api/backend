@@ -1,5 +1,10 @@
 # Script para configurar o Mercado Pago MCP Server
-# Uso: .\scripts\setup-mcp.ps1
+# Uso: .\scripts\setup-mcp.ps1 [TOKEN]
+# Exemplo: .\scripts\setup-mcp.ps1 APP_USR-1234567890-...
+
+param(
+    [string]$Token = ""
+)
 
 Write-Host "Configurando Mercado Pago MCP Server..." -ForegroundColor Cyan
 
@@ -9,8 +14,12 @@ if (-not (Test-Path .cursor)) {
     Write-Host "Diretório .cursor criado." -ForegroundColor Green
 }
 
-# Obter o token do ambiente ou solicitar ao usuário
-$token = $env:MP_ACCESS_TOKEN
+# Obter o token: parâmetro > variável de ambiente > solicitar ao usuário
+$token = $Token
+
+if (-not $token) {
+    $token = $env:MP_ACCESS_TOKEN
+}
 
 if (-not $token) {
     Write-Host "Token do Mercado Pago não encontrado nas variáveis de ambiente." -ForegroundColor Yellow

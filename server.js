@@ -1,5 +1,17 @@
 const dotenv = require('dotenv');
 dotenv.config();
+
+// Verificar configuração do Mercado Pago no início
+const mpToken = process.env.MP_ACCESS_TOKEN;
+if (!mpToken || mpToken.trim() === '' || mpToken === 'APP_USR-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx') {
+  console.warn('⚠️  AVISO: MP_ACCESS_TOKEN não configurado ou inválido');
+  console.warn('   Configure a variável MP_ACCESS_TOKEN no arquivo .env ou ecosystem.config.js');
+  console.warn('   Obtenha o token em: https://www.mercadopago.com.br/developers/panel/credentials');
+} else {
+  const tokenPreview = `${mpToken.substring(0, 10)}...${mpToken.substring(mpToken.length - 5)}`;
+  const tokenType = mpToken.startsWith('TEST-') ? 'TESTE' : mpToken.startsWith('APP_USR-') ? 'PRODUÇÃO' : 'DESCONHECIDO';
+  console.log(`✅ Mercado Pago configurado - Token: ${tokenPreview} (${tokenType})`);
+}
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -31,14 +43,39 @@ const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 
 function getMP() {
   const token = process.env.MP_ACCESS_TOKEN;
-  if (!token) return null;
-  try { mercadopago.configure({ access_token: token }); return mercadopago; } catch (_) { return null; }
+  if (!token || token.trim() === '' || token === 'APP_USR-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx') {
+    console.warn('MP_ACCESS_TOKEN não configurado ou inválido');
+    return null;
+  }
+  try { 
+    mercadopago.configure({ access_token: token.trim() }); 
+    return mercadopago; 
+  } catch (err) { 
+    console.error('Erro ao configurar Mercado Pago SDK v1:', err.message);
+    return null; 
+  }
 }
 
 function getMPClient() {
   const token = process.env.MP_ACCESS_TOKEN;
-  if (!token) return null;
-  try { return new MercadoPagoConfig({ access_token: token }); } catch (_) { return null; }
+  if (!token || token.trim() === '' || token === 'APP_USR-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx') {
+    console.warn('MP_ACCESS_TOKEN não configurado ou inválido');
+    return null;
+  }
+  try { 
+    return new MercadoPagoConfig({ access_token: token.trim() }); 
+  } catch (err) { 
+    console.error('Erro ao configurar Mercado Pago SDK v2:', err.message);
+    return null; 
+  }
+}
+
+function getMPToken() {
+  const token = process.env.MP_ACCESS_TOKEN;
+  if (!token || token.trim() === '' || token === 'APP_USR-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx') {
+    return null;
+  }
+  return token.trim();
 }
 
 function readPercentEnv(name, def) {
@@ -48,63 +85,188 @@ function readPercentEnv(name, def) {
 }
 
 async function createMpPreferenceForAmount({ mission, amount, kind, userEmail }) {
-  const token = process.env.MP_ACCESS_TOKEN;
-  if (!token) throw new Error('mp-unavailable');
+  const token = getMPToken();
+  if (!token) {
+    console.error('❌ MP_ACCESS_TOKEN não configurado ao criar preferência');
+    console.error('   Verifique se a variável MP_ACCESS_TOKEN está definida no ambiente');
+    throw new Error('mp-unavailable: Token do Mercado Pago não configurado. Verifique a variável MP_ACCESS_TOKEN.');
+  }
+  
+  // Log de debug (apenas preview do token)
+  const tokenPreview = `${token.substring(0, 10)}...${token.substring(token.length - 5)}`;
+  console.log(`🔐 Criando preferência MP com token: ${tokenPreview}`);
   const currency = 'BRL';
   const external_ref = `mission:${mission.id}:${kind || 'full'}`;
   const webhook = String(process.env.MP_WEBHOOK_URL || '');
   const hasHttpsWebhook = /^https:\/\//i.test(webhook);
   const base = String(process.env.BASE_URL || '').replace(/\/+$/,'');
   const sponsor = Number(process.env.MP_SPONSOR_ID || 0) || null;
-  const makePref = (minimal) => {
+  
+  // Função para criar preferência - versão ultra minimal para evitar PolicyAgent
+  const makePref = (ultraMinimal = false) => {
     const p = {
-      items: [{ title: mission.title || 'Serviço', quantity: 1, currency_id: currency, unit_price: amount }],
-      external_reference: external_ref,
-      metadata: { mission_id: mission.id, kind: kind || 'full' }
+      items: [{ 
+        title: (mission.title || 'Serviço').substring(0, 127), // Limitar tamanho do título
+        quantity: 1, 
+        currency_id: currency, 
+        unit_price: parseFloat(amount.toFixed(2)) // Garantir formato correto
+      }],
+      external_reference: external_ref
     };
-    if (!minimal) {
-      if (hasHttpsWebhook) p.notification_url = webhook;
-      if (userEmail && String(userEmail).includes('@')) p.payer = { email: String(userEmail).trim() };
-      if (base) p.back_urls = { success: base, pending: base, failure: base };
-      if (base) p.auto_return = 'approved';
-      if (sponsor) p.sponsor_id = sponsor;
+    
+    // Versão ultra minimal - apenas o essencial
+    if (ultraMinimal) {
+      return p;
     }
+    
+    // Adicionar metadata apenas se não for ultra minimal
+    p.metadata = { mission_id: mission.id, kind: kind || 'full' };
+    
+    // Adicionar campos opcionais gradualmente
+    if (hasHttpsWebhook && webhook) {
+      p.notification_url = webhook;
+    }
+    
+    if (userEmail && String(userEmail).includes('@')) {
+      p.payer = { email: String(userEmail).trim().substring(0, 254) };
+    }
+    
+    if (base) {
+      p.back_urls = { 
+        success: base, 
+        pending: base, 
+        failure: base 
+      };
+      p.auto_return = 'approved';
+    }
+    
+    if (sponsor && sponsor > 0) {
+      p.sponsor_id = sponsor;
+    }
+    
     return p;
   };
+  
+  // Tentar criar preferência completa primeiro
   let payload = makePref(false);
   let resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    headers: { 
+      Authorization: `Bearer ${token}`, 
+      'Content-Type': 'application/json',
+      'User-Agent': 'AppMissao-Backend/1.0'
+    },
     body: JSON.stringify(payload)
   });
+  
   if (!resp.ok) {
     let bodyText = await resp.text();
     let bodyJson = null;
     try { bodyJson = JSON.parse(bodyText); } catch (_) {}
     const track = resp.headers.get('x-meli-tracking-id') || '';
-    const policyUnauthorized = resp.status === 403 && bodyJson && (bodyJson.code === 'PA_UNAUTHORIZED_RESULT_FROM_POLICIES' || /PolicyAgent/i.test(String(bodyJson.blocked_by || '')));
+    
+    // Log detalhado do erro
+    console.error('❌ MP Preference Error (primeira tentativa):', {
+      status: resp.status,
+      code: bodyJson?.code,
+      message: bodyJson?.message,
+      error: bodyJson?.error,
+      blocked_by: bodyJson?.blocked_by,
+      tracking: track,
+      token_preview: token ? `${token.substring(0, 10)}...${token.substring(token.length - 5)}` : 'N/A',
+      has_token: !!token,
+      token_length: token ? token.length : 0
+    });
+    
+    // Se for erro 401, logar mais detalhes
+    if (resp.status === 401) {
+      console.error('🔴 ERRO 401 - Token não autorizado:', {
+        token_starts_with: token ? token.substring(0, 15) : 'N/A',
+        token_type: token ? (token.startsWith('TEST-') ? 'TEST' : token.startsWith('APP_USR-') ? 'PROD' : 'UNKNOWN') : 'N/A',
+        error_details: bodyJson
+      });
+    }
+    
+    const policyUnauthorized = resp.status === 403 && bodyJson && (
+      bodyJson.code === 'PA_UNAUTHORIZED_RESULT_FROM_POLICIES' || 
+      /PolicyAgent/i.test(String(bodyJson.blocked_by || ''))
+    );
+    
+    // Se for erro de PolicyAgent, tentar versão minimal
     if (policyUnauthorized) {
-      payload = makePref(true);
+      console.log('Tentando criar preferência minimal devido ao PolicyAgent...');
+      payload = makePref(true); // Ultra minimal
+      
       resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        headers: { 
+          Authorization: `Bearer ${token}`, 
+          'Content-Type': 'application/json',
+          'User-Agent': 'AppMissao-Backend/1.0'
+        },
         body: JSON.stringify(payload)
       });
+      
       if (!resp.ok) {
         bodyText = await resp.text();
         try { bodyJson = JSON.parse(bodyText); } catch (_) {}
+        const newTrack = resp.headers.get('x-meli-tracking-id') || '';
+        
+        console.error('MP Preference Error (tentativa minimal):', {
+          status: resp.status,
+          code: bodyJson?.code,
+          message: bodyJson?.message,
+          blocked_by: bodyJson?.blocked_by,
+          causes: bodyJson?.causes,
+          tracking: newTrack
+        });
+      } else {
+        console.log('Preferência minimal criada com sucesso!');
       }
     }
+    
+    // Se ainda falhou, lançar erro
     if (!resp.ok) {
       const msg = bodyJson && bodyJson.message ? bodyJson.message : bodyText;
-      const details = bodyJson && Array.isArray(bodyJson.causes) && bodyJson.causes.length ? bodyJson.causes.map(c => c.description || c.code || '').filter(Boolean).join('; ') : '';
+      const details = bodyJson && Array.isArray(bodyJson.causes) && bodyJson.causes.length 
+        ? bodyJson.causes.map(c => c.description || c.code || '').filter(Boolean).join('; ') 
+        : '';
       const out = details ? `${msg} - ${details}` : msg;
-      console.error('mp-preference-error', resp.status, out, track);
+      console.error('mp-preference-error-final', resp.status, out, track);
+      
+      // Verificar se é problema de token (401)
+      if (resp.status === 401) {
+        const tokenPreview = token ? `${token.substring(0, 10)}...${token.substring(token.length - 5)}` : 'não configurado';
+        console.error('Erro 401 - Token inválido ou não autorizado:', {
+          token_preview: tokenPreview,
+          error: bodyJson,
+          tracking: track
+        });
+        throw new Error(`Erro de autenticação do Mercado Pago (401). O token pode estar inválido, expirado ou não autorizado. Verifique a variável MP_ACCESS_TOKEN no servidor.`);
+      }
+      
+      // Verificar se é problema de PolicyAgent (403)
+      if (resp.status === 403 && policyUnauthorized) {
+        throw new Error(`Erro de autorização do Mercado Pago (403 - PolicyAgent). As políticas de segurança estão bloqueando a criação da preferência. Tente configurar as URLs no painel do Mercado Pago.`);
+      }
+      
       throw new Error(`mp-preference-failed ${resp.status} ${out}`);
     }
   }
+  
   const pref = await resp.json();
-  return { id: pref.id || pref.preference_id, init_point: pref.sandbox_init_point || pref.init_point, currency, external_ref };
+  console.log('Preferência criada com sucesso:', { 
+    id: pref.id || pref.preference_id,
+    has_init_point: !!pref.init_point,
+    has_sandbox_init_point: !!pref.sandbox_init_point
+  });
+  
+  return { 
+    id: pref.id || pref.preference_id, 
+    init_point: pref.sandbox_init_point || pref.init_point, 
+    currency, 
+    external_ref 
+  };
 }
 
 function broadcast(type, payload) {
@@ -778,55 +940,318 @@ app.post('/api/missions/:id/payments/preference', protect, async (req, res) => {
   }
 });
 
-app.post('/api/payments/mp/webhook', async (req, res) => {
+// Rota GET para verificar status do token do Mercado Pago
+app.get('/api/payments/mp/status', async (req, res) => {
   try {
-    const client = getMPClient();
+    const token = getMPToken();
+    const tokenPreview = token ? `${token.substring(0, 10)}...${token.substring(token.length - 5)}` : null;
+    const hasToken = !!token;
+    const isTestToken = token && token.startsWith('TEST-');
+    const isProdToken = token && token.startsWith('APP_USR-');
+    
+    let tokenStatus = 'unknown';
+    let tokenValid = false;
+    
+    if (hasToken) {
+      // Tentar validar o token fazendo uma requisição simples
+      try {
+        const testResp = await fetch('https://api.mercadopago.com/v1/payment_methods', {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          }
+        });
+        
+        if (testResp.ok) {
+          tokenStatus = 'valid';
+          tokenValid = true;
+        } else if (testResp.status === 401) {
+          tokenStatus = 'invalid_or_expired';
+          tokenValid = false;
+        } else {
+          tokenStatus = 'error';
+          tokenValid = false;
+        }
+      } catch (err) {
+        tokenStatus = 'validation_error';
+        tokenValid = false;
+      }
+    }
+    
+    res.json({
+      status: 'ok',
+      token: {
+        configured: hasToken,
+        preview: tokenPreview,
+        type: isTestToken ? 'test' : isProdToken ? 'production' : 'unknown',
+        status: tokenStatus,
+        valid: tokenValid
+      },
+      webhook: {
+        url: process.env.MP_WEBHOOK_URL || 'Não configurado',
+        configured: !!process.env.MP_WEBHOOK_URL
+      },
+      recommendations: !hasToken ? [
+        'Configure a variável MP_ACCESS_TOKEN no servidor',
+        'Obtenha o token em: https://www.mercadopago.com.br/developers/panel/credentials'
+      ] : !tokenValid ? [
+        'O token parece estar inválido ou expirado',
+        'Gere um novo token em: https://www.mercadopago.com.br/developers/panel/credentials',
+        'Reinicie o servidor após atualizar o token'
+      ] : []
+    });
+  } catch (err) {
+    console.error('Erro ao verificar status do MP:', err);
+    res.status(500).json({ message: 'Erro ao verificar status do Mercado Pago', error: err.message });
+  }
+});
+
+// Rota GET para testar se o webhook está configurado corretamente
+app.get('/api/payments/mp/webhook', async (req, res) => {
+  try {
+    const baseUrl = process.env.BASE_URL || req.protocol + '://' + req.get('host');
+    const webhookUrl = `${baseUrl}/api/payments/mp/webhook`;
+    const token = getMPToken();
+    
+    res.json({
+      status: 'ok',
+      message: 'Webhook do Mercado Pago está ativo',
+      webhook_url: webhookUrl,
+      instructions: {
+        step1: 'Acesse: https://www.mercadopago.com.br/developers/panel/app',
+        step2: 'Selecione sua aplicação',
+        step3: 'Vá em "Webhooks" ou "Notificações IPN"',
+        step4: `Configure a URL: ${webhookUrl}`,
+        step5: 'Salve as configurações'
+      },
+      current_config: {
+        mp_webhook_url: process.env.MP_WEBHOOK_URL || 'Não configurado',
+        mp_access_token: token ? 'Configurado' : 'Não configurado',
+        token_valid: token ? 'Verifique em /api/payments/mp/status' : 'N/A'
+      }
+    });
+  } catch (err) {
+    console.error('Erro ao verificar webhook:', err);
+    res.status(500).json({ message: 'Erro ao verificar configuração do webhook' });
+  }
+});
+
+// Rota POST para receber notificações do Mercado Pago
+app.post('/api/payments/mp/webhook', async (req, res) => {
+  const startTime = Date.now();
+  let notificationData = {
+    type: null,
+    payment_id: null,
+    received_at: new Date().toISOString(),
+    processed: false,
+    error: null
+  };
+
+  try {
+    // Log da notificação recebida
     const type = String(req.body.type || req.query.type || '');
     const id = Number((req.body.data && req.body.data.id) || req.query['data.id'] || 0);
-    if (type === 'payment' && id) {
-      let pay;
+    
+    notificationData.type = type;
+    notificationData.payment_id = id;
+    
+    console.log('=== Webhook MP Recebido ===', {
+      type,
+      id,
+      timestamp: new Date().toISOString(),
+      body: req.body,
+      query: req.query,
+      headers: {
+        'user-agent': req.get('user-agent'),
+        'x-forwarded-for': req.get('x-forwarded-for'),
+        'x-real-ip': req.get('x-real-ip')
+      }
+    });
+
+    // Validar se é uma notificação de pagamento
+    if (type !== 'payment' || !id) {
+      console.log('Notificação ignorada - tipo ou ID inválido:', { type, id });
+      notificationData.error = 'Tipo ou ID inválido';
+      return res.status(200).json({ 
+        ok: true, 
+        message: 'Notificação recebida mas ignorada (tipo ou ID inválido)',
+        type,
+        id 
+      });
+    }
+
+    // Buscar dados do pagamento no Mercado Pago
+    const token = getMPToken();
+    if (!token) {
+      console.error('MP_ACCESS_TOKEN não configurado - não é possível processar webhook');
+      notificationData.error = 'Token não configurado';
+      return res.status(503).json({ 
+        ok: false,
+        message: 'Mercado Pago não configurado. Verifique a variável MP_ACCESS_TOKEN.' 
+      });
+    }
+
+    const client = getMPClient();
+    let paymentData = null;
+    let pay = null;
+
+    try {
       if (client) {
         try {
           const payApi = new Payment(client);
           pay = await payApi.get({ id });
+          paymentData = pay && pay.body ? pay.body : pay;
         } catch (e) {
+          console.log('Erro ao buscar com SDK v2, tentando v1:', e.message);
+          // Verificar se é erro 401
+          if (e.status === 401 || (e.response && e.response.status === 401)) {
+            console.error('Erro 401 ao buscar pagamento - token inválido');
+            notificationData.error = 'Token inválido (401)';
+            return res.status(200).json({ 
+              ok: false,
+              message: 'Token do Mercado Pago inválido. Verifique MP_ACCESS_TOKEN.' 
+            });
+          }
           const mpv1 = getMP();
-          if (!mpv1) throw e;
+          if (!mpv1) {
+            console.error('Mercado Pago não configurado');
+            notificationData.error = 'Mercado Pago não configurado';
+            return res.status(503).json({ message: 'Mercado Pago não configurado' });
+          }
           pay = await mpv1.payment.get(id);
+          paymentData = pay && pay.body ? pay.body : pay;
         }
       } else {
         const mpv1 = getMP();
-        if (!mpv1) throw new Error('mp-unavailable');
-        pay = await mpv1.payment.get(id);
+        if (!mpv1) {
+          console.error('Mercado Pago não configurado');
+          notificationData.error = 'Mercado Pago não configurado';
+          return res.status(503).json({ message: 'Mercado Pago não configurado' });
+        }
+        try {
+          pay = await mpv1.payment.get(id);
+          paymentData = pay && pay.body ? pay.body : pay;
+        } catch (e) {
+          // Verificar se é erro 401
+          if (e.status === 401 || (e.response && e.response.status === 401)) {
+            console.error('Erro 401 ao buscar pagamento - token inválido');
+            notificationData.error = 'Token inválido (401)';
+            return res.status(200).json({ 
+              ok: false,
+              message: 'Token do Mercado Pago inválido. Verifique MP_ACCESS_TOKEN.' 
+            });
+          }
+          throw e;
+        }
       }
-      const data = pay && pay.body ? pay.body : pay;
-      const status = String(data.status || 'pending');
-      const amount = Number(data.transaction_amount || 0);
-      const ext = String(data.external_reference || '');
+
+      if (!paymentData) {
+        console.error('Dados do pagamento não encontrados no MP');
+        notificationData.error = 'Pagamento não encontrado';
+        return res.status(404).json({ message: 'Pagamento não encontrado' });
+      }
+
+      const status = String(paymentData.status || 'pending');
+      const amount = Number(paymentData.transaction_amount || 0);
+      const ext = String(paymentData.external_reference || '');
       let missionId = null;
       const mMatch = ext.match(/mission:(\d+)/);
       if (mMatch) missionId = Number(mMatch[1]);
-      await pool.query('UPDATE payments SET mp_payment_id = ?, status = ?, amount = ?, updated_at = CURRENT_TIMESTAMP WHERE mp_payment_id = ? OR (external_ref = ?)', [String(data.id), status, amount, String(data.id), ext]);
-      if (missionId) {
+
+      console.log('Processando pagamento:', {
+        payment_id: paymentData.id,
+        status,
+        amount,
+        external_ref: ext,
+        mission_id: missionId
+      });
+
+      // Atualizar ou criar registro de pagamento
+      const [existing] = await pool.query(
+        'SELECT * FROM payments WHERE mp_payment_id = ? OR external_ref = ? LIMIT 1', 
+        [String(paymentData.id), ext]
+      );
+      
+      if (existing.length > 0) {
+        const oldStatus = existing[0].status;
+        await pool.query(
+          'UPDATE payments SET mp_payment_id = ?, status = ?, amount = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', 
+          [String(paymentData.id), status, amount, existing[0].id]
+        );
+        console.log('Pagamento atualizado:', {
+          payment_db_id: existing[0].id,
+          old_status: oldStatus,
+          new_status: status
+        });
+      } else if (ext) {
+        // Criar novo registro se não existir
+        await pool.query(
+          'INSERT INTO payments (mission_id, mp_payment_id, amount, currency, status, external_ref) VALUES (?, ?, ?, ?, ?, ?)',
+          [missionId, String(paymentData.id), amount, paymentData.currency_id || 'BRL', status, ext]
+        );
+        console.log('Novo pagamento criado no banco');
+      }
+
+      // Atualizar status da missão se pagamento aprovado
+      if (missionId && status === 'approved') {
         const [mrows] = await pool.query('SELECT * FROM missions WHERE id = ? LIMIT 1', [missionId]);
         const mission = mrows[0];
-        if (mission) {
-          if (status === 'approved') {
-            const newStatus = 'in_progress';
-            await pool.query('UPDATE missions SET status = ? WHERE id = ?', [newStatus, missionId]);
-            const [out] = await pool.query('SELECT * FROM missions WHERE id = ?', [missionId]);
-            try {
-              broadcast('mission_updated', out[0]);
-              broadcast('mission_status', { id: out[0].id, status: out[0].status, user_id: out[0].user_id, provider_id: out[0].provider_id });
-            } catch (_) {}
+        if (mission && mission.status !== 'in_progress') {
+          const newStatus = 'in_progress';
+          await pool.query('UPDATE missions SET status = ? WHERE id = ?', [newStatus, missionId]);
+          const [out] = await pool.query('SELECT * FROM missions WHERE id = ?', [missionId]);
+          console.log('Missão atualizada para in_progress:', { mission_id: missionId });
+          try {
+            broadcast('mission_updated', out[0]);
+            broadcast('mission_status', { 
+              id: out[0].id, 
+              status: out[0].status, 
+              user_id: out[0].user_id, 
+              provider_id: out[0].provider_id 
+            });
+          } catch (err) {
+            console.error('Erro ao fazer broadcast:', err);
           }
         }
       }
+
+      notificationData.processed = true;
+      const processingTime = Date.now() - startTime;
+      
+      console.log('=== Webhook Processado com Sucesso ===', {
+        payment_id: paymentData.id,
+        status,
+        mission_id: missionId,
+        processing_time_ms: processingTime
+      });
+
+      res.json({ 
+        ok: true, 
+        message: 'Notificação processada com sucesso',
+        payment_id: paymentData.id,
+        status,
+        mission_id: missionId
+      });
+    } catch (err) {
+      console.error('Erro ao processar webhook do pagamento:', err);
+      notificationData.error = err.message;
+      // Sempre retornar 200 para evitar retentativas desnecessárias do MP
+      res.status(200).json({ 
+        ok: false, 
+        error: 'Erro ao processar notificação (logado para investigação)',
+        message: err.message 
+      });
     }
-    res.json({ ok: true });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Erro interno' });
+    console.error('Erro geral no webhook:', err);
+    notificationData.error = err.message;
+    // Sempre retornar 200 para evitar retentativas do Mercado Pago
+    res.status(200).json({ 
+      ok: false, 
+      error: 'Erro processado',
+      message: err.message 
+    });
   }
 });
 
