@@ -113,7 +113,7 @@ async function createMpPreferenceForAmount({ mission, amount, kind, userEmail })
   const webhook = String(process.env.MP_WEBHOOK_URL || '');
   const hasHttpsWebhook = /^https:\/\//i.test(webhook);
   const base = String(process.env.BASE_URL || '').replace(/\/+$/,'');
-  const sponsor = Number(process.env.MP_SPONSOR_ID || 0) || null;
+  
   
   // Função para criar preferência - versão ultra minimal para evitar PolicyAgent
   const makePref = (ultraMinimal = false) => {
@@ -153,15 +153,26 @@ async function createMpPreferenceForAmount({ mission, amount, kind, userEmail })
       p.auto_return = 'approved';
     }
     
-    if (sponsor && sponsor > 0) {
-      p.sponsor_id = sponsor;
-    }
+    
     
     return p;
   };
   
+  // Validar token antes de fazer requisição
+  if (!token || token.trim() === '') {
+    console.error('❌ Token vazio ao tentar criar preferência');
+    throw new Error('mp-unavailable: Token do Mercado Pago está vazio. Verifique a variável MP_ACCESS_TOKEN.');
+  }
+  
   // Tentar criar preferência completa primeiro
   let payload = makePref(false);
+  console.log('📤 Enviando requisição para criar preferência MP:', {
+    url: 'https://api.mercadopago.com/checkout/preferences',
+    token_preview: `${token.substring(0, 10)}...${token.substring(token.length - 5)}`,
+    has_token: !!token,
+    token_length: token.length
+  });
+  
   let resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
     method: 'POST',
     headers: { 
@@ -204,9 +215,13 @@ async function createMpPreferenceForAmount({ mission, amount, kind, userEmail })
       bodyJson.code === 'PA_UNAUTHORIZED_RESULT_FROM_POLICIES' || 
       /PolicyAgent/i.test(String(bodyJson.blocked_by || ''))
     );
+    const sponsorError = resp.status === 400 && (
+      (bodyJson && bodyJson.message && /sponsor_id/i.test(String(bodyJson.message))) ||
+      (Array.isArray(bodyJson && bodyJson.causes) && bodyJson.causes.some(c => /sponsor_id/i.test(String((c && (c.description || c.code || ''))))))
+    );
     
     // Se for erro de PolicyAgent, tentar versão minimal
-    if (policyUnauthorized) {
+    if (policyUnauthorized || sponsorError) {
       console.log('Tentando criar preferência minimal devido ao PolicyAgent...');
       payload = makePref(true); // Ultra minimal
       
@@ -956,7 +971,7 @@ app.post('/api/missions/:id/payments/preference', protect, async (req, res) => {
 // Rota GET para verificar status do token do Mercado Pago
 app.get('/api/payments/mp/status', async (req, res) => {
   try {
-    const token = getMPToken();
+    const token = process.env.MP_ACCESS_TOKEN;
     const tokenPreview = token ? `${token.substring(0, 10)}...${token.substring(token.length - 5)}` : null;
     const hasToken = !!token;
     const mpTokenType = process.env.MP_TOKEN_TYPE || '';
@@ -1016,10 +1031,7 @@ app.get('/api/payments/mp/status', async (req, res) => {
         status: tokenStatus,
         valid: tokenValid
       },
-      webhook: {
-        url: process.env.MP_WEBHOOK_URL || 'Não configurado',
-        configured: !!process.env.MP_WEBHOOK_URL
-      },
+      webhook: { url: process.env.MP_WEBHOOK_URL || 'Não configurado', configured: !!process.env.MP_WEBHOOK_URL },
       recommendations: !hasToken ? [
         'Configure a variável MP_ACCESS_TOKEN no servidor',
         'Obtenha o token em: https://www.mercadopago.com.br/developers/panel/credentials'
@@ -1040,7 +1052,7 @@ app.get('/api/payments/mp/webhook', async (req, res) => {
   try {
     const baseUrl = process.env.BASE_URL || req.protocol + '://' + req.get('host');
     const webhookUrl = `${baseUrl}/api/payments/mp/webhook`;
-    const token = getMPToken();
+    const token = process.env.MP_ACCESS_TOKEN;
     
     res.json({
       status: 'ok',
