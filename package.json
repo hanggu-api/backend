@@ -1,0 +1,34 @@
+{
+  "name": "appmissao-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "prestart": "powershell -ExecutionPolicy Bypass -File scripts/publish-github.ps1",
+    "start": "node server.js",
+    "test": "node scripts/smoke.test.js",
+    "test:integration": "node scripts/integration.test.js",
+    "test:realtime": "node scripts/realtime.test.js",
+    "test:badge": "node scripts/realtime-badge.test.js",
+    "test:chat": "node scripts/chat.test.js",
+    "publish:github": "powershell -ExecutionPolicy Bypass -File scripts/publish-github.ps1 $env:GITHUB_REPO_URL"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.744.0",
+    "@aws-sdk/s3-request-presigner": "^3.744.0",
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mercadopago": "^2.11.0",
+    "multer": "^1.4.5-lts.1",
+    "mysql2": "^3.15.3",
+    "node-fetch": "^3.3.2",
+    "ws": "^8.18.3"
+  }
+}
