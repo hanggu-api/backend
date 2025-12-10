@@ -54,34 +54,57 @@ async function createMpPreferenceForAmount({ mission, amount, kind, userEmail })
   const external_ref = `mission:${mission.id}:${kind || 'full'}`;
   const webhook = String(process.env.MP_WEBHOOK_URL || '');
   const hasHttpsWebhook = /^https:\/\//i.test(webhook);
-  const preference = {
-    items: [{ title: mission.title || 'Serviço', quantity: 1, currency_id: currency, unit_price: amount }],
-    external_reference: external_ref,
-    metadata: { mission_id: mission.id, kind: kind || 'full' }
+  const base = String(process.env.BASE_URL || '').replace(/\/+$/,'');
+  const sponsor = Number(process.env.MP_SPONSOR_ID || 0) || null;
+  const makePref = (minimal) => {
+    const p = {
+      items: [{ title: mission.title || 'Serviço', quantity: 1, currency_id: currency, unit_price: amount }],
+      external_reference: external_ref,
+      metadata: { mission_id: mission.id, kind: kind || 'full' }
+    };
+    if (!minimal) {
+      if (hasHttpsWebhook) p.notification_url = webhook;
+      if (userEmail && String(userEmail).includes('@')) p.payer = { email: String(userEmail).trim() };
+      if (base) p.back_urls = { success: base, pending: base, failure: base };
+      if (base) p.auto_return = 'approved';
+      if (sponsor) p.sponsor_id = sponsor;
+    }
+    return p;
   };
-  if (hasHttpsWebhook) preference.notification_url = webhook;
-  if (userEmail && String(userEmail).includes('@')) preference.payer = { email: String(userEmail).trim() };
-  const resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
+  let payload = makePref(false);
+  let resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(preference)
+    body: JSON.stringify(payload)
   });
   if (!resp.ok) {
     let bodyText = await resp.text();
     let bodyJson = null;
     try { bodyJson = JSON.parse(bodyText); } catch (_) {}
     const track = resp.headers.get('x-meli-tracking-id') || '';
-    if (bodyJson && bodyJson.message) {
-      const details = Array.isArray(bodyJson.causes) && bodyJson.causes.length ? bodyJson.causes.map(c => c.description || c.code || '').filter(Boolean).join('; ') : '';
-      const msg = details ? `${bodyJson.message} - ${details}` : bodyJson.message;
-      console.error('mp-preference-error', resp.status, msg, track);
-      throw new Error(`mp-preference-failed ${resp.status} ${msg}`);
+    const policyUnauthorized = resp.status === 403 && bodyJson && (bodyJson.code === 'PA_UNAUTHORIZED_RESULT_FROM_POLICIES' || /PolicyAgent/i.test(String(bodyJson.blocked_by || '')));
+    if (policyUnauthorized) {
+      payload = makePref(true);
+      resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!resp.ok) {
+        bodyText = await resp.text();
+        try { bodyJson = JSON.parse(bodyText); } catch (_) {}
+      }
     }
-    console.error('mp-preference-error', resp.status, bodyText, track);
-    throw new Error(`mp-preference-failed ${resp.status} ${bodyText}`);
+    if (!resp.ok) {
+      const msg = bodyJson && bodyJson.message ? bodyJson.message : bodyText;
+      const details = bodyJson && Array.isArray(bodyJson.causes) && bodyJson.causes.length ? bodyJson.causes.map(c => c.description || c.code || '').filter(Boolean).join('; ') : '';
+      const out = details ? `${msg} - ${details}` : msg;
+      console.error('mp-preference-error', resp.status, out, track);
+      throw new Error(`mp-preference-failed ${resp.status} ${out}`);
+    }
   }
   const pref = await resp.json();
-  return { id: pref.id || pref.preference_id, init_point: pref.init_point || pref.sandbox_init_point, currency, external_ref };
+  return { id: pref.id || pref.preference_id, init_point: pref.sandbox_init_point || pref.init_point, currency, external_ref };
 }
 
 function broadcast(type, payload) {
@@ -760,50 +783,93 @@ app.post('/api/payments/mp/webhook', async (req, res) => {
     const client = getMPClient();
     const type = String(req.body.type || req.query.type || '');
     const id = Number((req.body.data && req.body.data.id) || req.query['data.id'] || 0);
+    
+    // Log do webhook recebido para debug
+    console.log('Webhook MP recebido:', { type, id, body: req.body });
+    
     if (type === 'payment' && id) {
       let pay;
-      if (client) {
-        try {
-          const payApi = new Payment(client);
-          pay = await payApi.get({ id });
-        } catch (e) {
+      let paymentData = null;
+      
+      try {
+        if (client) {
+          try {
+            const payApi = new Payment(client);
+            pay = await payApi.get({ id });
+            paymentData = pay && pay.body ? pay.body : pay;
+          } catch (e) {
+            console.error('Erro ao buscar pagamento com MP v2:', e);
+            const mpv1 = getMP();
+            if (!mpv1) throw new Error('mp-unavailable');
+            pay = await mpv1.payment.get(id);
+            paymentData = pay && pay.body ? pay.body : pay;
+          }
+        } else {
           const mpv1 = getMP();
-          if (!mpv1) throw e;
+          if (!mpv1) {
+            console.error('Mercado Pago não configurado');
+            return res.status(503).json({ message: 'Mercado Pago não configurado' });
+          }
           pay = await mpv1.payment.get(id);
+          paymentData = pay && pay.body ? pay.body : pay;
         }
-      } else {
-        const mpv1 = getMP();
-        if (!mpv1) throw new Error('mp-unavailable');
-        pay = await mpv1.payment.get(id);
-      }
-      const data = pay && pay.body ? pay.body : pay;
-      const status = String(data.status || 'pending');
-      const amount = Number(data.transaction_amount || 0);
-      const ext = String(data.external_reference || '');
-      let missionId = null;
-      const mMatch = ext.match(/mission:(\d+)/);
-      if (mMatch) missionId = Number(mMatch[1]);
-      await pool.query('UPDATE payments SET mp_payment_id = ?, status = ?, amount = ?, updated_at = CURRENT_TIMESTAMP WHERE mp_payment_id = ? OR (external_ref = ?)', [String(data.id), status, amount, String(data.id), ext]);
-      if (missionId) {
-        const [mrows] = await pool.query('SELECT * FROM missions WHERE id = ? LIMIT 1', [missionId]);
-        const mission = mrows[0];
-        if (mission) {
-          if (status === 'approved') {
+
+        if (!paymentData) {
+          console.error('Dados do pagamento não encontrados');
+          return res.status(404).json({ message: 'Pagamento não encontrado' });
+        }
+
+        const status = String(paymentData.status || 'pending');
+        const amount = Number(paymentData.transaction_amount || 0);
+        const ext = String(paymentData.external_reference || '');
+        let missionId = null;
+        const mMatch = ext.match(/mission:(\d+)/);
+        if (mMatch) missionId = Number(mMatch[1]);
+
+        // Atualizar ou criar registro de pagamento
+        const [existing] = await pool.query('SELECT * FROM payments WHERE mp_payment_id = ? OR external_ref = ? LIMIT 1', [String(paymentData.id), ext]);
+        
+        if (existing.length > 0) {
+          await pool.query('UPDATE payments SET mp_payment_id = ?, status = ?, amount = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', 
+            [String(paymentData.id), status, amount, existing[0].id]);
+        } else if (ext) {
+          // Criar novo registro se não existir
+          await pool.query('INSERT INTO payments (mission_id, mp_payment_id, amount, currency, status, external_ref) VALUES (?, ?, ?, ?, ?, ?)',
+            [missionId, String(paymentData.id), amount, paymentData.currency_id || 'BRL', status, ext]);
+        }
+
+        // Atualizar status da missão se pagamento aprovado
+        if (missionId && status === 'approved') {
+          const [mrows] = await pool.query('SELECT * FROM missions WHERE id = ? LIMIT 1', [missionId]);
+          const mission = mrows[0];
+          if (mission && mission.status !== 'in_progress') {
             const newStatus = 'in_progress';
             await pool.query('UPDATE missions SET status = ? WHERE id = ?', [newStatus, missionId]);
             const [out] = await pool.query('SELECT * FROM missions WHERE id = ?', [missionId]);
             try {
               broadcast('mission_updated', out[0]);
               broadcast('mission_status', { id: out[0].id, status: out[0].status, user_id: out[0].user_id, provider_id: out[0].provider_id });
-            } catch (_) {}
+            } catch (err) {
+              console.error('Erro ao fazer broadcast:', err);
+            }
           }
         }
+
+        console.log('Webhook processado com sucesso:', { paymentId: paymentData.id, status, missionId });
+      } catch (err) {
+        console.error('Erro ao processar webhook do pagamento:', err);
+        // Retornar 200 mesmo com erro para evitar retentativas desnecessárias do MP
+        // mas logar o erro para investigação
       }
+    } else {
+      console.log('Webhook ignorado - tipo ou ID inválido:', { type, id });
     }
+    
     res.json({ ok: true });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Erro interno' });
+    console.error('Erro geral no webhook:', err);
+    // Sempre retornar 200 para evitar retentativas do Mercado Pago
+    res.status(200).json({ ok: false, error: 'Erro processado' });
   }
 });
 
@@ -818,6 +884,127 @@ app.get('/api/missions/:id/payments', protect, async (req, res) => {
     if (!owner && !provider) return res.status(403).json({ message: 'Sem permissão' });
     const [rows] = await pool.query('SELECT * FROM payments WHERE mission_id = ? ORDER BY created_at DESC', [id]);
     res.json({ items: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Erro interno' });
+  }
+});
+
+// Consultar pagamento específico do Mercado Pago
+app.get('/api/payments/mp/:paymentId', protect, async (req, res) => {
+  try {
+    const paymentId = String(req.params.paymentId);
+    if (!paymentId) return res.status(400).json({ message: 'ID do pagamento é obrigatório' });
+
+    const client = getMPClient();
+    let paymentData = null;
+
+    if (client) {
+      try {
+        const payApi = new Payment(client);
+        const pay = await payApi.get({ id: paymentId });
+        paymentData = pay && pay.body ? pay.body : pay;
+      } catch (e) {
+        const mpv1 = getMP();
+        if (!mpv1) throw new Error('mp-unavailable');
+        const pay = await mpv1.payment.get(paymentId);
+        paymentData = pay && pay.body ? pay.body : pay;
+      }
+    } else {
+      const mpv1 = getMP();
+      if (!mpv1) return res.status(503).json({ message: 'Mercado Pago não configurado' });
+      const pay = await mpv1.payment.get(paymentId);
+      paymentData = pay && pay.body ? pay.body : pay;
+    }
+
+    if (!paymentData) {
+      return res.status(404).json({ message: 'Pagamento não encontrado' });
+    }
+
+    res.json({
+      id: paymentData.id,
+      status: paymentData.status,
+      status_detail: paymentData.status_detail,
+      transaction_amount: paymentData.transaction_amount,
+      currency_id: paymentData.currency_id,
+      date_created: paymentData.date_created,
+      date_approved: paymentData.date_approved,
+      payment_method_id: paymentData.payment_method_id,
+      payment_type_id: paymentData.payment_type_id,
+      external_reference: paymentData.external_reference,
+      payer: paymentData.payer
+    });
+  } catch (err) {
+    console.error('Erro ao consultar pagamento MP:', err);
+    const msg = err && err.message ? String(err.message) : 'Erro ao consultar pagamento';
+    res.status(500).json({ message: msg });
+  }
+});
+
+// Verificar status de pagamento por external_reference
+app.get('/api/payments/status/:externalRef', protect, async (req, res) => {
+  try {
+    const externalRef = String(req.params.externalRef);
+    if (!externalRef) return res.status(400).json({ message: 'Referência externa é obrigatória' });
+
+    const [rows] = await pool.query('SELECT * FROM payments WHERE external_ref = ? ORDER BY created_at DESC LIMIT 1', [externalRef]);
+    const payment = rows[0];
+
+    if (!payment) {
+      return res.status(404).json({ message: 'Pagamento não encontrado' });
+    }
+
+    // Se tiver payment_id do MP, buscar dados atualizados
+    if (payment.mp_payment_id) {
+      try {
+        const client = getMPClient();
+        let paymentData = null;
+
+        if (client) {
+          try {
+            const payApi = new Payment(client);
+            const pay = await payApi.get({ id: payment.mp_payment_id });
+            paymentData = pay && pay.body ? pay.body : pay;
+          } catch (e) {
+            const mpv1 = getMP();
+            if (mpv1) {
+              const pay = await mpv1.payment.get(payment.mp_payment_id);
+              paymentData = pay && pay.body ? pay.body : pay;
+            }
+          }
+        } else {
+          const mpv1 = getMP();
+          if (mpv1) {
+            const pay = await mpv1.payment.get(payment.mp_payment_id);
+            paymentData = pay && pay.body ? pay.body : pay;
+          }
+        }
+
+        if (paymentData) {
+          // Atualizar status no banco se mudou
+          const newStatus = String(paymentData.status || 'pending');
+          if (newStatus !== payment.status) {
+            await pool.query('UPDATE payments SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [newStatus, payment.id]);
+            payment.status = newStatus;
+          }
+        }
+      } catch (err) {
+        console.error('Erro ao atualizar status do pagamento:', err);
+      }
+    }
+
+    res.json({
+      id: payment.id,
+      mission_id: payment.mission_id,
+      status: payment.status,
+      amount: payment.amount,
+      currency: payment.currency,
+      mp_payment_id: payment.mp_payment_id,
+      mp_preference_id: payment.mp_preference_id,
+      external_ref: payment.external_ref,
+      created_at: payment.created_at,
+      updated_at: payment.updated_at
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Erro interno' });

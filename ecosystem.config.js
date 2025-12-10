@@ -15,7 +15,7 @@ module.exports = {
         DB_PASSWORD: '719732Monica10@',
         DB_NAME: 'app',
         DB_PORT: 3306,
-        MP_ACCESS_TOKEN: 'APP_USR-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+        MP_ACCESS_TOKEN: 'APP_USR-7034531044731441-121009-293b90e1c6ea8a8473b79d4efbc2c45f-2535373119',
         MP_WEBHOOK_URL: 'https://api.seudominio.com/api/payments/mp/webhook',
         R2_ACCOUNT_ID: '5e23ea0ee33b534c24ef31372b96f4ec',
         R2_ACCESS_KEY_ID: '63efabdfcf8804068945dbcb7c61bcb8',
