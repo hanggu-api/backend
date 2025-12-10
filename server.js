@@ -11,6 +11,10 @@ const { protect } = require('./authMiddleware');
 const app = express();
 app.use(express.json());
 app.use(cors());
+app.use((req, res, next) => {
+  res.setHeader('Content-Security-Policy', "script-src 'self' https://static.cloudflareinsights.com; script-src-elem 'self' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com https://static.cloudflareinsights.com");
+  next();
+});
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
