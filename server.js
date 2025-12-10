@@ -48,28 +48,39 @@ function readPercentEnv(name, def) {
 }
 
 async function createMpPreferenceForAmount({ mission, amount, kind, userEmail }) {
-  const client = getMPClient();
-  if (!client) throw new Error('mp-unavailable');
+  const token = process.env.MP_ACCESS_TOKEN;
+  if (!token) throw new Error('mp-unavailable');
   const currency = 'BRL';
   const external_ref = `mission:${mission.id}:${kind || 'full'}`;
-  const notif = process.env.MP_WEBHOOK_URL || `${process.env.BASE_URL || 'http://localhost:3000'}/api/payments/mp/webhook`;
+  const webhook = String(process.env.MP_WEBHOOK_URL || '');
+  const hasHttpsWebhook = /^https:\/\//i.test(webhook);
   const preference = {
     items: [{ title: mission.title || 'Serviço', quantity: 1, currency_id: currency, unit_price: amount }],
     external_reference: external_ref,
-    notification_url: notif,
-    payer: { email: userEmail || undefined },
-    statement_descriptor: 'AppMissao'
+    metadata: { mission_id: mission.id, kind: kind || 'full' }
   };
-  const prefApi = new Preference(client);
-  let out;
-  try {
-    out = await prefApi.create({ body: preference });
-  } catch (e) {
-    const mpv1 = getMP();
-    if (!mpv1) throw e;
-    out = await mpv1.preferences.create(preference);
+  if (hasHttpsWebhook) preference.notification_url = webhook;
+  if (userEmail && String(userEmail).includes('@')) preference.payer = { email: String(userEmail).trim() };
+  const resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(preference)
+  });
+  if (!resp.ok) {
+    let bodyText = await resp.text();
+    let bodyJson = null;
+    try { bodyJson = JSON.parse(bodyText); } catch (_) {}
+    const track = resp.headers.get('x-meli-tracking-id') || '';
+    if (bodyJson && bodyJson.message) {
+      const details = Array.isArray(bodyJson.causes) && bodyJson.causes.length ? bodyJson.causes.map(c => c.description || c.code || '').filter(Boolean).join('; ') : '';
+      const msg = details ? `${bodyJson.message} - ${details}` : bodyJson.message;
+      console.error('mp-preference-error', resp.status, msg, track);
+      throw new Error(`mp-preference-failed ${resp.status} ${msg}`);
+    }
+    console.error('mp-preference-error', resp.status, bodyText, track);
+    throw new Error(`mp-preference-failed ${resp.status} ${bodyText}`);
   }
-  const pref = out && out.body ? out.body : out;
+  const pref = await resp.json();
   return { id: pref.id || pref.preference_id, init_point: pref.init_point || pref.sandbox_init_point, currency, external_ref };
 }
 
@@ -716,8 +727,6 @@ app.post('/api/missions/:id/chat/messages', protect, async (req, res) => {
 app.post('/api/missions/:id/payments/preference', protect, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const client = getMPClient();
-    if (!client) return res.status(500).json({ message: 'Pagamento indisponível' });
     const [mrows] = await pool.query('SELECT * FROM missions WHERE id = ? LIMIT 1', [id]);
     const mission = mrows[0];
     if (!mission) return res.status(404).json({ message: 'Missão não encontrada' });
@@ -749,17 +758,22 @@ app.post('/api/missions/:id/payments/preference', protect, async (req, res) => {
 app.post('/api/payments/mp/webhook', async (req, res) => {
   try {
     const client = getMPClient();
-    if (!client) return res.status(500).json({ message: 'Pagamento indisponível' });
     const type = String(req.body.type || req.query.type || '');
     const id = Number((req.body.data && req.body.data.id) || req.query['data.id'] || 0);
     if (type === 'payment' && id) {
-      const payApi = new Payment(client);
       let pay;
-      try {
-        pay = await payApi.get({ id });
-      } catch (e) {
+      if (client) {
+        try {
+          const payApi = new Payment(client);
+          pay = await payApi.get({ id });
+        } catch (e) {
+          const mpv1 = getMP();
+          if (!mpv1) throw e;
+          pay = await mpv1.payment.get(id);
+        }
+      } else {
         const mpv1 = getMP();
-        if (!mpv1) throw e;
+        if (!mpv1) throw new Error('mp-unavailable');
         pay = await mpv1.payment.get(id);
       }
       const data = pay && pay.body ? pay.body : pay;

@@ -45,5 +45,7 @@ $stats = Invoke-RestMethod -Uri "$Base/api/proposals/stats" -Headers @{ Authoriz
 
 $missionOut = Invoke-RestMethod -Uri "$Base/api/missions/$mid"
 
-$summary = [PSCustomObject]@{ missionId=$mid; proposalId=$propId; missionStatus=$missionOut.mission.status; stats=$stats }
+$pref = JsonPost "$Base/api/missions/$mid/payments/preference" $authCli @{}
+
+$summary = [PSCustomObject]@{ missionId=$mid; proposalId=$propId; missionStatus=$missionOut.mission.status; stats=$stats; preference=$pref }
 $summary | ConvertTo-Json -Depth 6
