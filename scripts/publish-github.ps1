@@ -37,7 +37,9 @@ function New-GitHubRepo([string]$name, [bool]$isPrivate) {
   $headers = @{ Authorization = "Bearer $($env:GITHUB_PAT)"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
   $body = @{ name = $name; private = $isPrivate; description = 'Backend AppMissao' } | ConvertTo-Json
   try {
-    $resp = Invoke-RestMethod -Method Post -Uri 'https://api.github.com/user/repos' -Headers $headers -Body $body
+    $org = $env:GITHUB_ORG
+    $endpoint = if ($org -and $org.Trim().Length -gt 0) { "https://api.github.com/orgs/$org/repos" } else { 'https://api.github.com/user/repos' }
+    $resp = Invoke-RestMethod -Method Post -Uri $endpoint -Headers $headers -Body $body
     if ($resp.name -eq $name) { Write-Host "Repositório criado: $name"; return $true } else { return $false }
   } catch { Write-Warning "Falha ao criar repositório: $($_.Exception.Message)"; return $false }
 }
@@ -53,19 +55,19 @@ git add -A
 try { git commit -m ("Auto push: " + (Get-Date -Format s)) } catch { Write-Host "Nenhuma alteração para commit" }
 
 git branch -M $Branch
-if ($origin) {
-  git push -u origin $Branch
-  if ($LASTEXITCODE -ne 0) {
-    $repoName = Get-RepoNameFromRemote($Remote)
-    if (-not $env:GITHUB_USER) { $env:GITHUB_USER = $repoName } # fallback
-    $created = New-GitHubRepo -name $repoName -isPrivate:$true
-    if ($created) {
-      $newRemote = "https://github.com/$($env:GITHUB_USER)/$repoName.git"
-      if ($env:GITHUB_USER -and $env:GITHUB_PAT) { $newRemote = $newRemote -replace '^https://', "https://$($env:GITHUB_USER):$($env:GITHUB_PAT)@" }
-      git remote set-url origin $newRemote
-      git push -u origin $Branch
+  if ($origin) {
+    git push -u origin $Branch
+    if ($LASTEXITCODE -ne 0) {
+      $repoName = Get-RepoNameFromRemote($Remote)
+      if (-not $env:GITHUB_USER) { $env:GITHUB_USER = $repoName } # fallback
+      $created = New-GitHubRepo -name $repoName -isPrivate:$true
+      if ($created) {
+        $newRemote = if ($env:GITHUB_ORG -and $env:GITHUB_ORG.Trim().Length -gt 0) { "https://github.com/$($env:GITHUB_ORG)/$repoName.git" } else { "https://github.com/$($env:GITHUB_USER)/$repoName.git" }
+        if ($env:GITHUB_USER -and $env:GITHUB_PAT) { $newRemote = $newRemote -replace '^https://', "https://$($env:GITHUB_USER):$($env:GITHUB_PAT)@" }
+        git remote set-url origin $newRemote
+        git push -u origin $Branch
+      }
     }
-  }
-} else {
+  } else {
   Write-Warning "Nenhum remote 'origin' configurado. Exemplo: setx GITHUB_REPO_URL https://github.com/usuario/repo.git"
 }
