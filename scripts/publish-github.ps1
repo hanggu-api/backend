@@ -19,6 +19,13 @@ if ($env:GIT_USER_EMAIL) { git config user.email $env:GIT_USER_EMAIL }
 
 $Remote = if ($Remote -and $Remote.Trim().Length -gt 0) { $Remote } elseif ($env:GITHUB_REPO_URL) { $env:GITHUB_REPO_URL } else { $null }
 
+# Opcional: usar PAT via variáveis de ambiente
+if ($Remote -and $env:GITHUB_USER -and $env:GITHUB_PAT) {
+  if ($Remote.StartsWith('https://')) {
+    $Remote = $Remote -replace '^https://', "https://$($env:GITHUB_USER):$($env:GITHUB_PAT)@"
+  }
+}
+
 $origin = ""
 try { $origin = git remote get-url origin | Select-Object -First 1 } catch { $origin = "" }
 if ($Remote -and $Remote.Trim().Length -gt 0) {
