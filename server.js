@@ -23,11 +23,50 @@ const upload = multer();
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const mercadopago = require('mercadopago');
+const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 
 function getMP() {
   const token = process.env.MP_ACCESS_TOKEN;
   if (!token) return null;
   try { mercadopago.configure({ access_token: token }); return mercadopago; } catch (_) { return null; }
+}
+
+function getMPClient() {
+  const token = process.env.MP_ACCESS_TOKEN;
+  if (!token) return null;
+  try { return new MercadoPagoConfig({ access_token: token }); } catch (_) { return null; }
+}
+
+function readPercentEnv(name, def) {
+  const v = Number(process.env[name]);
+  if (!isFinite(v) || v <= 0) return def;
+  return Math.min(100, Math.max(1, Math.round(v)));
+}
+
+async function createMpPreferenceForAmount({ mission, amount, kind, userEmail }) {
+  const client = getMPClient();
+  if (!client) throw new Error('mp-unavailable');
+  const currency = 'BRL';
+  const external_ref = `mission:${mission.id}:${kind || 'full'}`;
+  const notif = process.env.MP_WEBHOOK_URL || `${process.env.BASE_URL || 'http://localhost:3000'}/api/payments/mp/webhook`;
+  const preference = {
+    items: [{ title: mission.title || 'Serviço', quantity: 1, currency_id: currency, unit_price: amount }],
+    external_reference: external_ref,
+    notification_url: notif,
+    payer: { email: userEmail || undefined },
+    statement_descriptor: 'AppMissao'
+  };
+  const prefApi = new Preference(client);
+  let out;
+  try {
+    out = await prefApi.create({ body: preference });
+  } catch (e) {
+    const mpv1 = getMP();
+    if (!mpv1) throw e;
+    out = await mpv1.preferences.create(preference);
+  }
+  const pref = out && out.body ? out.body : out;
+  return { id: pref.id || pref.preference_id, init_point: pref.init_point || pref.sandbox_init_point, currency, external_ref };
 }
 
 function broadcast(type, payload) {
@@ -343,7 +382,8 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     res.json({ token, user: normalizeUser(user) });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: 'Erro interno' });
+    const msg = err && err.message ? String(err.message) : 'Erro interno';
+    res.status(500).json({ message: msg });
   }
 });
 
@@ -396,9 +436,20 @@ app.post('/api/missions', protect, async (req, res) => {
       'INSERT INTO missions (user_id, title, description, location, lat, lng, budget, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [userId, String(title).trim(), description || null, location || null, la, lo, b, status]
     );
-  const [rows] = await pool.query('SELECT * FROM missions WHERE id = ?', [result.insertId]);
-    res.status(201).json({ mission: rows[0] });
-    try { broadcast('mission_created', rows[0]); } catch (_) {}
+    const [rows] = await pool.query('SELECT * FROM missions WHERE id = ?', [result.insertId]);
+    const mission = rows[0];
+    try {
+      const depoPct = readPercentEnv('PAYMENT_DEPOSIT_PERCENT', 30);
+      const total = Number(mission.budget || 0);
+      if (total > 0 && depoPct > 0) {
+        const amount = Math.round((total * depoPct / 100) * 100) / 100;
+        const pref = await createMpPreferenceForAmount({ mission, amount, kind: 'deposit', userEmail: req.user.email });
+        await pool.query('INSERT INTO payments (mission_id, proposal_id, user_id, provider_id, amount, currency, status, mp_preference_id, external_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [mission.id, null, req.user.id, mission.provider_id || null, amount, pref.currency, 'pending', pref.id || null, pref.external_ref]);
+        try { broadcast('payment_created', { mission_id: mission.id, kind: 'deposit', init_point: pref.init_point }); } catch (_) {}
+      }
+    } catch (_) {}
+    res.status(201).json({ mission });
+    try { broadcast('mission_created', mission); } catch (_) {}
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Erro interno' });
@@ -534,6 +585,19 @@ app.patch('/api/missions/:id', protect, async (req, res) => {
     broadcast('mission_updated', out[0]);
     broadcast('mission_status', { id: out[0].id, status: out[0].status, user_id: out[0].user_id, provider_id: out[0].provider_id });
   } catch (_) {}
+  if (String(updates.status || '') === 'completed') {
+    try {
+      await pool.query("UPDATE payments SET status = 'released' WHERE mission_id = ? AND status = 'approved'", [id]);
+      try { broadcast('payment_released', { mission_id: id }); } catch (_) {}
+    } catch (_) {}
+  }
+  if (String(updates.status || '') === 'cancelled') {
+    try {
+      const ext = `mission:${id}:deposit`;
+      await pool.query("UPDATE payments SET status = 'released' WHERE mission_id = ? AND status = 'approved' AND external_ref = ?", [id, ext]);
+      try { broadcast('payment_released', { mission_id: id, kind: 'deposit' }); } catch (_) {}
+    } catch (_) {}
+  }
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Erro interno' });
@@ -575,6 +639,20 @@ app.post('/api/missions/:id/provider-status', protect, async (req, res) => {
   const [out] = await pool.query('SELECT * FROM missions WHERE id = ?', [id]);
   res.json({ mission: out[0] });
   try { broadcast('mission_status', { id: out[0].id, status: out[0].status, user_id: out[0].user_id, provider_id: out[0].provider_id }); } catch (_) {}
+  if (String(status) === 'awaiting_confirmation') {
+    try {
+      const [props] = await pool.query("SELECT * FROM proposals WHERE mission_id = ? AND status = 'accepted' ORDER BY id DESC LIMIT 1", [id]);
+      const accepted = props[0] || null;
+      const total = accepted ? Number(accepted.price) : Number(out[0].budget || 0);
+      const remPct = readPercentEnv('PAYMENT_SECOND_PERCENT', 75);
+      if (total > 0 && remPct > 0) {
+        const amount = Math.round((total * remPct / 100) * 100) / 100;
+        const pref = await createMpPreferenceForAmount({ mission: out[0], amount, kind: 'remainder', userEmail: null });
+        await pool.query('INSERT INTO payments (mission_id, proposal_id, user_id, provider_id, amount, currency, status, mp_preference_id, external_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, accepted ? accepted.id : null, out[0].user_id, out[0].provider_id || null, amount, pref.currency, 'pending', pref.id || null, pref.external_ref]);
+        try { broadcast('payment_created', { mission_id: id, kind: 'remainder', init_point: pref.init_point }); } catch (_) {}
+      }
+    } catch (_) {}
+  }
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Erro interno' });
@@ -634,45 +712,52 @@ app.post('/api/missions/:id/chat/messages', protect, async (req, res) => {
 app.post('/api/missions/:id/payments/preference', protect, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const mp = getMP();
-    if (!mp) return res.status(500).json({ message: 'Pagamento indisponível' });
+    const client = getMPClient();
+    if (!client) return res.status(500).json({ message: 'Pagamento indisponível' });
     const [mrows] = await pool.query('SELECT * FROM missions WHERE id = ? LIMIT 1', [id]);
     const mission = mrows[0];
     if (!mission) return res.status(404).json({ message: 'Missão não encontrada' });
     const owner = mission.user_id === req.user.id;
     if (!owner) return res.status(403).json({ message: 'Sem permissão' });
     const [props] = await pool.query("SELECT * FROM proposals WHERE mission_id = ? AND status = 'accepted' ORDER BY id DESC LIMIT 1", [id]);
-    const accepted = props[0] || null;
-    const amount = accepted ? Number(accepted.price) : Number(mission.budget || 0);
-    if (!(amount > 0)) return res.status(400).json({ message: 'Valor inválido para pagamento' });
-    const currency = 'BRL';
-    const external_ref = `mission:${id}`;
-    const notif = process.env.MP_WEBHOOK_URL || `${process.env.BASE_URL || 'http://localhost:3000'}/api/payments/mp/webhook`;
-    const preference = {
-      items: [{ title: mission.title || 'Serviço', quantity: 1, currency_id: currency, unit_price: amount }],
-      external_reference: external_ref,
-      notification_url: notif,
-      payer: { email: req.user.email || undefined },
-      statement_descriptor: 'AppMissao'
-    };
-    const out = await mp.preferences.create(preference);
-    const pref = out && out.body ? out.body : out;
-    await pool.query('INSERT INTO payments (mission_id, proposal_id, user_id, provider_id, amount, currency, status, mp_preference_id, external_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, accepted ? accepted.id : null, req.user.id, mission.provider_id || null, amount, currency, 'pending', pref.id || pref.preference_id || null, external_ref]);
-    res.json({ init_point: pref.init_point || pref.sandbox_init_point, preference_id: pref.id || pref.preference_id });
+  const accepted = props[0] || null;
+  const kind = String(req.body.kind || 'full');
+  const total = accepted ? Number(accepted.price) : Number(mission.budget || 0);
+  let amount = total;
+  if (kind === 'deposit') {
+    const depoPct = readPercentEnv('PAYMENT_DEPOSIT_PERCENT', 30);
+    amount = Math.round((total * depoPct / 100) * 100) / 100;
+  } else if (kind === 'remainder') {
+    const remPct = readPercentEnv('PAYMENT_SECOND_PERCENT', 75);
+    amount = Math.round((total * remPct / 100) * 100) / 100;
+  }
+  if (!(amount > 0)) return res.status(400).json({ message: 'Valor inválido para pagamento' });
+  const pref = await createMpPreferenceForAmount({ mission, amount, kind, userEmail: req.user.email });
+  await pool.query('INSERT INTO payments (mission_id, proposal_id, user_id, provider_id, amount, currency, status, mp_preference_id, external_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, accepted ? accepted.id : null, req.user.id, mission.provider_id || null, amount, pref.currency, 'pending', pref.id || null, pref.external_ref]);
+  res.json({ init_point: pref.init_point, preference_id: pref.id });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: 'Erro interno' });
+    const msg = err && err.message ? String(err.message) : 'Erro interno';
+    res.status(500).json({ message: msg });
   }
 });
 
 app.post('/api/payments/mp/webhook', async (req, res) => {
   try {
-    const mp = getMP();
-    if (!mp) return res.status(500).json({ message: 'Pagamento indisponível' });
+    const client = getMPClient();
+    if (!client) return res.status(500).json({ message: 'Pagamento indisponível' });
     const type = String(req.body.type || req.query.type || '');
     const id = Number((req.body.data && req.body.data.id) || req.query['data.id'] || 0);
     if (type === 'payment' && id) {
-      const pay = await mp.payment.get(id);
+      const payApi = new Payment(client);
+      let pay;
+      try {
+        pay = await payApi.get({ id });
+      } catch (e) {
+        const mpv1 = getMP();
+        if (!mpv1) throw e;
+        pay = await mpv1.payment.get(id);
+      }
       const data = pay && pay.body ? pay.body : pay;
       const status = String(data.status || 'pending');
       const amount = Number(data.transaction_amount || 0);
@@ -1298,7 +1383,7 @@ app.patch('/api/providers/me', protect, async (req, res) => {
   }
 });
 
-const port = Number(process.env.PORT || 3000);
+const port = Number(process.env.PORT || 4001);
 ensureDatabase()
   .then(() => ensureUsersTable())
   .then(() => ensureRoleColumn())
