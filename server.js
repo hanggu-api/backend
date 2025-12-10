@@ -3,13 +3,26 @@ dotenv.config();
 
 // Verificar configuração do Mercado Pago no início
 const mpToken = process.env.MP_ACCESS_TOKEN;
+const mpTokenType = process.env.MP_TOKEN_TYPE || ''; // Permite forçar o tipo: 'test' ou 'production'
 if (!mpToken || mpToken.trim() === '' || mpToken === 'APP_USR-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx') {
   console.warn('⚠️  AVISO: MP_ACCESS_TOKEN não configurado ou inválido');
   console.warn('   Configure a variável MP_ACCESS_TOKEN no arquivo .env ou ecosystem.config.js');
   console.warn('   Obtenha o token em: https://www.mercadopago.com.br/developers/panel/credentials');
 } else {
   const tokenPreview = `${mpToken.substring(0, 10)}...${mpToken.substring(mpToken.length - 5)}`;
-  const tokenType = mpToken.startsWith('TEST-') ? 'TESTE' : mpToken.startsWith('APP_USR-') ? 'PRODUÇÃO' : 'DESCONHECIDO';
+  // Detectar tipo do token - pode ser forçado via MP_TOKEN_TYPE ou detectado automaticamente
+  let tokenType = 'DESCONHECIDO';
+  if (mpTokenType.toLowerCase() === 'test' || mpTokenType.toLowerCase() === 'teste') {
+    tokenType = 'TESTE';
+  } else if (mpTokenType.toLowerCase() === 'production' || mpTokenType.toLowerCase() === 'producao') {
+    tokenType = 'PRODUÇÃO';
+  } else if (mpToken.startsWith('TEST-')) {
+    tokenType = 'TESTE';
+  } else if (mpToken.startsWith('APP_USR-')) {
+    // Por padrão, APP_USR- é produção, mas pode ser teste também
+    // Se não especificado, assumir produção mas avisar
+    tokenType = 'PRODUÇÃO (se for teste, configure MP_TOKEN_TYPE=test)';
+  }
   console.log(`✅ Mercado Pago configurado - Token: ${tokenPreview} (${tokenType})`);
 }
 const express = require('express');
@@ -946,8 +959,23 @@ app.get('/api/payments/mp/status', async (req, res) => {
     const token = getMPToken();
     const tokenPreview = token ? `${token.substring(0, 10)}...${token.substring(token.length - 5)}` : null;
     const hasToken = !!token;
-    const isTestToken = token && token.startsWith('TEST-');
-    const isProdToken = token && token.startsWith('APP_USR-');
+    const mpTokenType = process.env.MP_TOKEN_TYPE || '';
+    // Detectar tipo do token - pode ser forçado via MP_TOKEN_TYPE
+    let isTestToken = false;
+    let isProdToken = false;
+    if (token) {
+      if (mpTokenType.toLowerCase() === 'test' || mpTokenType.toLowerCase() === 'teste') {
+        isTestToken = true;
+      } else if (mpTokenType.toLowerCase() === 'production' || mpTokenType.toLowerCase() === 'producao') {
+        isProdToken = true;
+      } else if (token.startsWith('TEST-')) {
+        isTestToken = true;
+      } else if (token.startsWith('APP_USR-')) {
+        // Por padrão assume produção, mas pode ser teste também
+        // Se não especificado, assumir produção
+        isProdToken = true;
+      }
+    }
     
     let tokenStatus = 'unknown';
     let tokenValid = false;

@@ -16,6 +16,7 @@ module.exports = {
         DB_NAME: 'app',
         DB_PORT: 3306,
         MP_ACCESS_TOKEN: 'APP_USR-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+        MP_TOKEN_TYPE: 'test', // 'test' ou 'production' - especifica o tipo do token
         MP_WEBHOOK_URL: 'https://api.seudominio.com/api/payments/mp/webhook',
         R2_ACCOUNT_ID: '5e23ea0ee33b534c24ef31372b96f4ec',
         R2_ACCESS_KEY_ID: '63efabdfcf8804068945dbcb7c61bcb8',
