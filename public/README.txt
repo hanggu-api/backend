@@ -1,0 +1,1 @@
+Static bucket for Cloudflare Pages site deployment.

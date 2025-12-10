@@ -14,8 +14,10 @@ app.use(cors());
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const serverless = require('serverless-http');
+const isVercel = !!process.env.VERCEL;
+const server = isVercel ? null : http.createServer(app);
+const wss = isVercel ? null : new WebSocketServer({ server });
 const multer = require('multer');
 const upload = multer();
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
@@ -29,15 +31,22 @@ function getMP() {
 }
 
 function broadcast(type, payload) {
+  if (!wss) return;
   const msg = JSON.stringify({ type, payload });
   wss.clients.forEach((client) => {
     try { client.send(msg); } catch (_) {}
   });
+
+if (isVercel) {
+  module.exports = serverless(app);
+}
 }
 
-wss.on('connection', (ws) => {
-  ws.on('error', () => {});
-});
+if (wss) {
+  wss.on('connection', (ws) => {
+    ws.on('error', () => {});
+  });
+}
 
 async function ensureDatabase() {
   const host = process.env.MYSQL_HOST || process.env.DB_HOST || 'localhost';
@@ -1306,9 +1315,11 @@ ensureDatabase()
   .then(() => ensurePaymentsTable())
   .catch(err => { console.error(err); })
   .finally(() => {
-    server.listen(port, '0.0.0.0', () => {
-      console.log(`Servidor iniciado na porta ${port}`);
-    });
+    if (!isVercel && server) {
+      server.listen(port, '0.0.0.0', () => {
+        console.log(`Servidor iniciado na porta ${port}`);
+      });
+    }
   });
 async function ensureMessagesTable() {
   const sql = `CREATE TABLE IF NOT EXISTS messages (

@@ -1,0 +1,6 @@
+name = "hanggu-backend"
+main = "./functions/api.js"
+compatibility_date = "2024-11-20"
+
+[site]
+bucket = "./public"
