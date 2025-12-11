@@ -1,4 +1,4 @@
-name = "hanggu-backend"
+name = "backend"
 main = "./functions/api.js"
 compatibility_date = "2024-11-20"
 
