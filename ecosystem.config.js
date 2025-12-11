@@ -3,7 +3,11 @@ module.exports = {
     {
       name: 'appmissao-backend',
       cwd: __dirname,
-      script: 'server.js',      
+      script: 'server.js',  
+      instances: 'max', // Utiliza todos os núcleos da CPU
+      exec_mode: 'cluster', // Habilita o modo cluster
+      max_memory_restart: '500M', // Reinicia se passar de 500MB (Ajuste conforme sua necessidade)
+      watch: true, // Desabilitar watch em produção    
       env: {
         NODE_ENV: 'production',
         PORT: 4001,

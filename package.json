@@ -11,6 +11,7 @@
     "test:realtime": "node scripts/realtime.test.js",
     "test:badge": "node scripts/realtime-badge.test.js",
     "test:chat": "node scripts/chat.test.js",
+    "test:mercadopago": "node scripts/test-mercadopago.js",
     "publish:github": "powershell -ExecutionPolicy Bypass -File scripts/publish-github.ps1 $env:GITHUB_REPO_URL",
     "sftp:watch": "node scripts/sftp-watch.js"
   },
